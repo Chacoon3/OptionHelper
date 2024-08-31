@@ -1,5 +1,6 @@
 import datetime
 import numpy as np
+import pandas as pd
 from scipy.stats import norm
 from scipy.optimize import newton, brentq
 
@@ -7,16 +8,40 @@ __secondInYear = 31536000
 def __convertT(T):
     if type(T) == datetime.datetime or type(T) == datetime.date or type(T) == np.datetime64:
         raise ValueError("T must be a number of years or timedelta")
-    elif type(T) == datetime.timedelta:
+    elif type(T) == datetime.timedelta or type(T) == np.timedelta64 or type(T) == pd.Timedelta:
         T = T.total_seconds() / __secondInYear
     T = max(T, 1 / __secondInYear)
     return T
 
-def ivGuess(s, c, T):
-    return (2 * np.pi / T) ** 0.5 * c / s
 
 def errorCheck():
     raise ValueError("This is an error")    # python errors can be captured by dot net caller
+
+
+def ivGuess(s, c, T):
+    return (2 * np.pi / T) ** 0.5 * c / s
+
+
+def bsIv(S, K, T, r, market_price, option_type):
+    if market_price == np.nan:
+        raise ValueError("Market price must be a number")
+    T = __convertT(T)
+
+    if option_type == 'call':
+        def objective_function(sigma):
+            return bsCall(S, K, T, r, sigma) - market_price
+    elif option_type == 'put':
+        def objective_function(sigma):
+            return bsPut(S, K, T, r, sigma) - market_price
+    else:
+        raise ValueError("Invalid option type. Must be 'call' or 'put'.")
+
+    try:
+        iv = newton(objective_function, maxiter= 100, x0=ivGuess(S, market_price, T))
+    except:
+        iv = brentq(objective_function, 1e-6, 1000)    
+    return iv
+
 
 def bsDelta(S, K, T, r, sigma, option_type='call'):
     T = __convertT(T)
@@ -64,29 +89,6 @@ def bsVega(S, K, T, r, sigma):
     return vega / 100
 
 
-def bsIv(S, K, T, r, market_price, option_type):
-    if market_price == np.nan:
-        raise ValueError("Market price must be a number")
-    T = __convertT(T)
-
-    if option_type == 'call':
-        def objective_function(sigma):
-            return bsCall(S, K, T, r, sigma) - market_price
-    elif option_type == 'put':
-        def objective_function(sigma):
-            return bsPut(S, K, T, r, sigma) - market_price
-    else:
-        raise ValueError("Invalid option type. Must be 'call' or 'put'.")
-
-    try:
-        iv = newton(objective_function, maxiter= 100, x0=ivGuess(S, market_price, T))
-    except:
-        try:
-            iv = brentq(objective_function, 1e-6, 1000)    
-        except:
-            iv = 10 # serves as an fallback to represent a very high IV
-    return iv
-
 def bsRho(S, K, T, r, sigma, option_type='call'):
     T = __convertT(T)
     d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
@@ -118,19 +120,33 @@ def bsTheta(S, K, T, r, sigma, option_type='call'):
     return theta
 
 
-def bsVomma(S, K, T, r, sigma):
-    T = __convertT(T)
+def bsPdeRightHandSide(optionPrice, stockPrice, iv, delta, gamma, r, theta):
+    return 0.5 ** (gamma * iv) ** 2 + r * delta * stockPrice - r * optionPrice + theta
 
-    d1 = (np.log(S / K) + (r + 0.5 * sigma**2) * T) / (sigma * np.sqrt(T))
-    d2 = d1 - sigma * np.sqrt(T)
-    vomma = S * np.sqrt(T) * norm.pdf(d1) * d1 * d2 / sigma
-    return vomma
+
+def getBsMeasures(S, K, T, r, option_type, marketPrice, sigmaFallback = None):
+    T = __convertT(T)
+    try:
+        sigma = bsIv(S, K, T, r, marketPrice, option_type)
+    except:
+        sigma = sigmaFallback
+
+    delta = bsDelta(S, K, T, r, sigma, option_type)
+    gamma = bsGamma(S, K, T, r, sigma)
+    vega = bsVega(S, K, T, r, sigma)
+    theta = bsTheta(S, K, T, r, sigma, option_type)
+    rho = bsRho(S, K, T, r, sigma, option_type)
+    return sigma, delta, gamma, vega, theta, rho
 
 
 import regex as re
+import pytz
+
+et = pytz.timezone('US/Eastern')
 class OptionSymbol:
 
-    def getSymbolString(stock_symbol,option_type,  strike_price, expiration_date:datetime.datetime):
+    @staticmethod
+    def getSymbolString(stock_symbol,option_type, strike_price, expiration_date:datetime.datetime):
 
         # Convert expiration date to YYMMDD format
         exp_date = expiration_date.strftime("%y%m%d")
@@ -144,15 +160,18 @@ class OptionSymbol:
         return option_symbol
 
 
-    def __init__(self, symbol, underlying, strike, expiration:datetime.datetime, optionType):
-        self.symbol:str = symbol
+    def __init__(self, underlying, strike, expiration:datetime.datetime, optionType):
+        self.symbol:str = OptionSymbol.getSymbolString(underlying, optionType, strike, expiration)
         self.underlying:str = underlying
         self.strike:float = strike
-        self.expiration:datetime.datetime = expiration
+        if expiration.tzinfo is None:
+            self.expiration:datetime.datetime = et.localize( expiration)
+        else:
+            self.expiration:datetime.datetime = expiration
         self.optionType:str = optionType
 
     def __str__(self):
-        return self.getSymbolString(self.underlying, self.expiration, self.optionType, self.strike)
+        return OptionSymbol.getSymbolString(self.underlying, self.optionType, self.strike, self.expiration)
 
 
     def  __dict__(self):
@@ -190,4 +209,40 @@ class OptionSymbol:
         option_type = "call" if match.group('option_type') == 'C' else "put"
         strike_price = int(match.group('strike_price')) / 1000.0
 
-        return OptionSymbol(option_symbol_str, stock_symbol, strike_price, expirationTime, option_type, )
+        return OptionSymbol(stock_symbol, strike_price, expirationTime, option_type, )
+    
+
+class OptionBook:
+
+    def __init__(self, book:dict[OptionSymbol, int], underlying:str = None) -> None:
+        self.book = book
+        if underlying is not None:
+            self.__underlying = underlying
+        else:
+            self.__underlying = book.keys().__iter__().__next__().underlying
+
+    def add(self, option:OptionSymbol, quantity:int):
+        if option in self.book:
+            self.book[option] += quantity
+        else:
+            self.book[option] = quantity
+
+    def remove(self, option:OptionSymbol, quantity:int):
+        if option in self.book:
+            self.book[option] -= quantity
+            if self.book[option] <= 0:
+                del self.book[option]
+
+    @property
+    def underlying(self):
+        return self.__underlying
+    
+    @property
+    def symbol(self):
+        return f"{self.underlying}-option-book"
+    
+    def __str__(self):
+        return str(self.book)
+
+    def __iter__(self):
+        return iter(self.book.items())
